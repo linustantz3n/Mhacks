@@ -119,6 +119,9 @@ export default function DashboardPage() {
         // Show success message for generated CSV
         if (data.source === 'csv-generated') {
           console.log(`✅ Generated new CSV with ${data.totalProfiles} profiles: ${data.csvFile}`);
+        } else if (data.source === 'csv-generated-fallback') {
+          console.log(`⚠️ Used fallback search: ${data.notice}`);
+          console.log(`✅ Generated CSV with ${data.totalProfiles} profiles: ${data.csvFile}`);
         } else if (data.source === 'csv') {
           console.log(`📁 Using existing CSV data`);
         } else if (data.source === 'mock-fallback') {
@@ -278,6 +281,10 @@ export default function DashboardPage() {
               {dataSource === 'csv' || dataSource === 'csv-generated' ? (
                 <span className="ml-2 px-2 py-1 bg-green-500/20 text-green-300 rounded-md text-xs">
                   📊 Real LinkedIn Data (Fresh)
+                </span>
+              ) : dataSource === 'csv-generated-fallback' ? (
+                <span className="ml-2 px-2 py-1 bg-yellow-500/20 text-yellow-300 rounded-md text-xs">
+                  ⚠️ Real Data (Location Fallback)
                 </span>
               ) : dataSource === 'mock-fallback' ? (
                 <span className="ml-2 px-2 py-1 bg-yellow-500/20 text-yellow-300 rounded-md text-xs">

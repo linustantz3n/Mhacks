@@ -37,19 +37,32 @@ export function scoreCandidates(args: { user: UserProfile; intent: string; candi
   const intentRole = roleHints.find((h) => textContains(intent, h));
   const intentCompanyMatch = /at\s+([A-Za-z0-9\-\.& ]+)/i.exec(intent || '')?.[1]?.trim();
 
-  return candidates.map((c) => {
+  const scored = candidates.map((c) => {
     let score = 0;
     const reasons: string[] = [];
 
+    // Schools and companies affinity (PRIORITIZED FOR UMICH STUDENTS)
+    let hasAlumniAffinity = false;
+    if (user.schools && user.schools.length > 0) {
+      for (const s of user.schools) {
+        if (textContains(c.summary, s) || textContains(c.company, s)) {
+          score += 0.4; // MAJOR boost for University of Michigan alumni
+          reasons.push('alumni-affinity');
+          hasAlumniAffinity = true;
+          break;
+        }
+      }
+    }
+
     // Role/title similarity
     if (intentRole && textContains(c.title, intentRole)) {
-      score += 0.3;
+      score += hasAlumniAffinity ? 0.2 : 0.25; // Slightly lower for alumni since they already get big boost
       reasons.push('role-match');
     }
 
     // Company match
     if (intentCompanyMatch && textContains(c.company, intentCompanyMatch)) {
-      score += 0.25;
+      score += hasAlumniAffinity ? 0.15 : 0.2; // Slightly lower for alumni since they already get big boost
       reasons.push('company-match');
     }
 
@@ -60,26 +73,15 @@ export function scoreCandidates(args: { user: UserProfile; intent: string; candi
       .slice(0, 5)
       .some((w) => textContains(c.summary, w));
     if (sumHit) {
-      score += 0.15;
+      score += 0.1; // Reduced importance
       reasons.push('summary-overlap');
     }
 
     // Skills overlap (if we had them)
     const skillsOverlap = tokenOverlap(user.skills || [], (c.summary || '').toLowerCase().split(/\W+/));
     if (skillsOverlap > 0) {
-      score += Math.min(0.15, skillsOverlap * 0.15);
+      score += Math.min(0.1, skillsOverlap * 0.1); // Reduced importance
       reasons.push('skills-overlap');
-    }
-
-    // Schools and companies affinity
-    if (user.schools && user.schools.length > 0) {
-      for (const s of user.schools) {
-        if (textContains(c.summary, s) || textContains(c.company, s)) {
-          score += 0.1;
-          reasons.push('alumni-affinity');
-          break;
-        }
-      }
     }
 
     if (user.companies && user.companies.length > 0 && c.company) {
@@ -101,4 +103,7 @@ export function scoreCandidates(args: { user: UserProfile; intent: string; candi
       reasons,
     };
   });
+
+  // Sort by score (highest first)
+  return scored.sort((a, b) => b.score - a.score);
 }

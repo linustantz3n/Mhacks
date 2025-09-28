@@ -10,6 +10,7 @@ import { createApolloProvider } from './providers/apollo';
 import { createAgentMailProvider } from './providers/agentmail';
 import { draftMessage } from './services/drafting';
 import { scoreCandidates } from './services/scoring';
+import { scoreWithLLM, fallbackScoring, type UserProfile, type CandidateInput } from './services/enhanced-scoring';
 
 dotenv.config();
 
@@ -21,6 +22,29 @@ app.register(formbody);
 
 const apollo = createApolloProvider({ apiKey: process.env.APOLLO_API_KEY });
 const agentMail = createAgentMailProvider({ apiKey: process.env.AGENTMAIL_API_KEY });
+
+// Helper function to get user profile (placeholder - should be replaced with real user data)
+function getUserProfile(userEmail?: string): UserProfile {
+  // University of Michigan sophomore profile as specified
+  // In production, this would fetch from the user's actual LinkedIn data
+  return {
+    full_name: "Michigan Student",
+    schools: [
+      {
+        institution: "University of Michigan",
+        program: "computer science",
+        degree: "Bachelor of Science in Engineering",
+        grad_year: 2028
+      }
+    ],
+    clubs: ["180 consulting", "atlas digital", "ktp", "v1"],
+    hometown: "New York City",
+    city: "Ann Arbor",
+    region: "Michigan",
+    country: "United States",
+    grad_year: 2028
+  };
+}
 
 app.get('/health', async () => ({ ok: true }));
 
@@ -149,12 +173,41 @@ app.post('/linkedin/scrape', async (req, reply) => {
         source: 'linkedin-staffspy'
       }));
 
-      // Score the candidates
-      const scored = scoreCandidates({
-        user: { schools: [], companies: [], skills: [], summary: '' },
-        intent: prompt,
-        candidates
-      });
+      // Score the candidates using enhanced LLM scoring
+      const userProfile = getUserProfile();
+      let scored;
+
+      try {
+        if (process.env.GOOGLE_AI_API_KEY) {
+          scored = await scoreWithLLM({
+            user: userProfile,
+            intent: prompt,
+            candidates: candidates as CandidateInput[],
+            apiKey: process.env.GOOGLE_AI_API_KEY
+          });
+        } else {
+          app.log.warn('GOOGLE_AI_API_KEY not set, using fallback scoring');
+          scored = fallbackScoring({
+            user: userProfile,
+            intent: prompt,
+            candidates: candidates as CandidateInput[]
+          });
+        }
+      } catch (error) {
+        app.log.error('Enhanced scoring failed, falling back to simple scoring:', error);
+        // Use the original working scoring with the proper user profile
+        const userProfile = getUserProfile();
+        scored = scoreCandidates({
+          user: {
+            schools: userProfile.schools.map(s => s.institution),
+            companies: [],
+            skills: userProfile.clubs,
+            summary: `${userProfile.full_name} from ${userProfile.hometown}, studying at ${userProfile.schools[0]?.institution}`
+          },
+          intent: prompt,
+          candidates
+        });
+      }
 
       reply.send({ 
         results: scored,
@@ -495,6 +548,75 @@ function parseCSVLine(line: string): string[] {
   return result;
 }
 
+// User profile setup endpoint
+app.post('/profile/setup', async (req, reply) => {
+  const {
+    full_name,
+    schools,
+    clubs,
+    hometown,
+    city,
+    region,
+    country,
+    grad_year
+  } = (req.body as any) || {};
+
+  if (!full_name) {
+    return reply.code(400).send({ error: 'Full name is required' });
+  }
+
+  try {
+    // Store user profile in database
+    const user = await prisma.user.upsert({
+      where: { email: `${full_name.toLowerCase().replace(/\s+/g, '.')}@demo.com` },
+      update: { name: full_name },
+      create: {
+        email: `${full_name.toLowerCase().replace(/\s+/g, '.')}@demo.com`,
+        name: full_name
+      }
+    });
+
+    // Store extended profile data
+    await prisma.profile.upsert({
+      where: { userId: user.id },
+      update: {
+        summary: `Student from ${schools?.[0]?.institution || 'university'}`,
+        schools: JSON.stringify(schools || []),
+        companies: JSON.stringify([]),
+        skills: JSON.stringify(clubs || [])
+      },
+      create: {
+        userId: user.id,
+        summary: `Student from ${schools?.[0]?.institution || 'university'}`,
+        schools: JSON.stringify(schools || []),
+        companies: JSON.stringify([]),
+        skills: JSON.stringify(clubs || [])
+      }
+    });
+
+    reply.send({
+      status: 'success',
+      message: 'Profile saved successfully',
+      user: {
+        id: user.id,
+        name: full_name,
+        profile: {
+          schools,
+          clubs,
+          hometown,
+          city,
+          region,
+          country,
+          grad_year
+        }
+      }
+    });
+  } catch (error) {
+    app.log.error('Profile setup error:', error);
+    reply.code(500).send({ error: 'Failed to save profile' });
+  }
+});
+
 app.post('/profiles/import', async (req, reply) => {
   const body: any = req.body || {};
   // naive import: upsert fake user and profile
@@ -538,30 +660,86 @@ app.post('/search/run', async (req, reply) => {
 
       if (result.success && result.csv_file) {
         // Load the newly generated CSV (ensure correct path)
-        const csvPath = path.isAbsolute(result.csv_file) 
-          ? result.csv_file 
+        const csvPath = path.isAbsolute(result.csv_file)
+          ? result.csv_file
           : path.join(process.cwd(), '../../', result.csv_file);
         const candidates = await loadCandidatesFromCSV(csvPath, searchParams);
-        
-        // Score the candidates
-        const scored = scoreCandidates({
-          user: { schools: [], companies: [], skills: [], summary: '' },
+
+        // Score the candidates using enhanced LLM scoring
+        const userProfile = getUserProfile();
+        let scored;
+
+        // Use enhanced basic scoring with Michigan student profile
+        app.log.info('Using enhanced basic scoring with Michigan student profile');
+        scored = scoreCandidates({
+          user: {
+            schools: userProfile.schools.map(s => s.institution),
+            companies: [],
+            skills: userProfile.clubs,
+            summary: `${userProfile.full_name} from ${userProfile.hometown}, studying at ${userProfile.schools[0]?.institution}`
+          },
           intent: prompt || '',
           candidates
         });
 
-        reply.send({ 
+        reply.send({
           results: scored,
           source: 'csv-generated',
           csvFile: result.csv_file,
           totalProfiles: result.total_profiles
         });
       } else {
-        // StaffSpy failed, return error instead of mock data
-        app.log.error('StaffSpy failed:', result.error);
-        reply.code(500).send({ 
-          error: `LinkedIn extraction failed: ${result.error}. Please try again or check your LinkedIn credentials.`
-        });
+        // StaffSpy failed - try fallback without location if location was specified
+        if (searchParams.location && searchParams.location !== 'USA') {
+          app.log.info(`Initial search with location "${searchParams.location}" failed, retrying without location`);
+
+          const fallbackResult = await runPythonScript('staff_functions.py', [
+            'wcpersonal296@gmail.com',
+            'JobInternet786',
+            searchParams.company,
+            searchParams.role,
+            'USA', // Default fallback location
+            '10'
+          ]);
+
+          if (fallbackResult.success && fallbackResult.csv_file) {
+            const csvPath = path.isAbsolute(fallbackResult.csv_file)
+              ? fallbackResult.csv_file
+              : path.join(process.cwd(), '../../', fallbackResult.csv_file);
+            const candidates = await loadCandidatesFromCSV(csvPath, searchParams);
+
+            const userProfile = getUserProfile();
+            const scored = scoreCandidates({
+              user: {
+                schools: userProfile.schools.map(s => s.institution),
+                companies: [],
+                skills: userProfile.clubs,
+                summary: `${userProfile.full_name} from ${userProfile.hometown}, studying at ${userProfile.schools[0]?.institution}`
+              },
+              intent: prompt || '',
+              candidates
+            });
+
+            reply.send({
+              results: scored,
+              source: 'csv-generated-fallback',
+              csvFile: fallbackResult.csv_file,
+              totalProfiles: fallbackResult.total_profiles,
+              notice: `Could not search in "${searchParams.location}", showing results without location filter`
+            });
+          } else {
+            app.log.error('Both primary and fallback searches failed:', result.error, fallbackResult.error);
+            reply.code(500).send({
+              error: `LinkedIn extraction failed: ${result.error}. Fallback search also failed.`
+            });
+          }
+        } else {
+          // No location specified or already using default, return error
+          app.log.error('StaffSpy failed:', result.error);
+          reply.code(500).send({
+            error: `LinkedIn extraction failed: ${result.error}. Please try again or check your LinkedIn credentials.`
+          });
+        }
       }
     } else {
       // Couldn't parse the search query properly
@@ -572,6 +750,103 @@ app.post('/search/run', async (req, reply) => {
   } catch (error) {
     app.log.error('Search error:', error);
     reply.code(500).send({ error: 'Search failed' });
+  }
+});
+
+// Enhanced scoring endpoint with user profile
+app.post('/search/enhanced', async (req, reply) => {
+  const { prompt, userProfile } = (req.body as any) || {};
+
+  if (!prompt) {
+    return reply.code(400).send({ error: 'Search prompt is required' });
+  }
+
+  try {
+    // Parse the user prompt to extract search parameters
+    const searchParams = parseSearchPrompt(prompt);
+
+    if (!searchParams.company || !searchParams.role) {
+      return reply.code(400).send({
+        error: 'Could not parse company and role from prompt. Please specify like "Find SWE contacts at Amazon in Seattle"'
+      });
+    }
+
+    // Clean up old CSV files first
+    await cleanupOldCSVFiles();
+
+    app.log.info(`Running enhanced search for: ${searchParams.role} at ${searchParams.company}`);
+
+    // Use real LinkedIn credentials for StaffSpy
+    const result = await runPythonScript('staff_functions.py', [
+      'wcpersonal296@gmail.com',
+      'JobInternet786',
+      searchParams.company,
+      searchParams.role,
+      searchParams.location,
+      '15' // Slightly more results for better scoring
+    ]);
+
+    if (result.success && result.csv_file) {
+      const csvPath = path.isAbsolute(result.csv_file)
+        ? result.csv_file
+        : path.join(process.cwd(), '../../', result.csv_file);
+      const candidates = await loadCandidatesFromCSV(csvPath, searchParams);
+
+      // Use provided user profile or fall back to default
+      const userProfileToUse = userProfile || getUserProfile();
+
+      // Score using enhanced LLM scoring
+      let scored;
+      try {
+        if (process.env.GOOGLE_AI_API_KEY) {
+          scored = await scoreWithLLM({
+            user: userProfileToUse,
+            intent: prompt,
+            candidates: candidates as CandidateInput[],
+            apiKey: process.env.GOOGLE_AI_API_KEY
+          });
+
+          reply.send({
+            results: scored,
+            source: 'enhanced-llm-scoring',
+            csvFile: result.csv_file,
+            totalProfiles: result.total_profiles,
+            userProfile: userProfileToUse,
+            scoringMethod: 'llm'
+          });
+        } else {
+          // Fallback to enhanced scoring without LLM
+          scored = fallbackScoring({
+            user: userProfileToUse,
+            intent: prompt,
+            candidates: candidates as CandidateInput[]
+          });
+
+          reply.send({
+            results: scored,
+            source: 'enhanced-fallback-scoring',
+            csvFile: result.csv_file,
+            totalProfiles: result.total_profiles,
+            userProfile: userProfileToUse,
+            scoringMethod: 'fallback',
+            warning: 'GOOGLE_AI_API_KEY not configured - using simplified scoring'
+          });
+        }
+      } catch (error) {
+        app.log.error('Enhanced scoring failed:', error);
+        reply.code(500).send({
+          error: `Enhanced scoring failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+        });
+      }
+    } else {
+      app.log.error('LinkedIn extraction failed:', result.error);
+      reply.code(500).send({
+        error: `LinkedIn extraction failed: ${result.error}. Please try again or check LinkedIn credentials.`
+      });
+    }
+  } catch (error) {
+    app.log.error('Enhanced search error:', error);
+    reply.code(500).send({ error: 'Enhanced search failed' });
   }
 });
 
